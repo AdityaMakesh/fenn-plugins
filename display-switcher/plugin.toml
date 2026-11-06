@@ -1,0 +1,8 @@
+id      = "display-mode"
+name    = "Display Mode"
+icon    = "monitor"
+size    = "wide"
+run     = ["python", "main.py"]
+description = "Switch between PC screen only, Duplicate, Extend and Second screen only."
+author  = "you"
+version = "1.0.0"
