@@ -1,0 +1,9 @@
+id      = "lyrics"
+name    = "Lyrics"
+icon    = "music-notes"
+size    = "wide"
+run     = ["python", "main.py"]
+page_size = [560, 220]
+description = "Shows the lyrics of the song playing in Spotify, line by line (looked up on lrclib.net)."
+author  = "you"
+version = "1.1.0"
