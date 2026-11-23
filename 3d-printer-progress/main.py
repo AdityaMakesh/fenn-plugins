@@ -1,6 +1,9 @@
-"""3D print progress for Fenn (Flashforge Adventurer 5M / 5M Pro).
+"""3D print progress for Fenn: Flashforge Adventurer 5M / 5M Pro, or any Klipper printer.
 
-Talks only to your printer, on your own network. Two ways in, both standard library only:
+Talks only to your printer, on your own network. Three ways in, all standard library only:
+
+* Klipper with Fluidd or Mainsail (including a 5M running Klipper): Moonraker's web API on
+  port 7125, which only needs the IP address. Picked automatically when Moonraker answers.
 
 * IP address only (default): the printer's text interface on port 8899. Each check opens a
   short session (~M601 S1 ... ~M602), reads status, layer and temperatures, and closes it.
@@ -23,6 +26,8 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 
@@ -30,6 +35,8 @@ import fenn
 
 POLL_ACTIVE, POLL_IDLE, POLL_OFFLINE = 5, 20, 15  # seconds between status requests
 POLL_ACTIVE_TCP = 10  # the IP-only route holds the printer's control session briefly
+MOONRAKER_PORT = 7125  # the web API behind Fluidd and Mainsail
+FIRMWARES = ["auto", "flashforge", "klipper"]  # the Settings chips, in order
 OPEN_PANEL_WHEN_DONE = False  # True: open the notch by itself when a print finishes
 FIELDS = ("ip", "serial", "code", "camera")
 HOST = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -54,6 +61,10 @@ ICONS = {  # state -> (icon, colour)
     "busy": ("clock", "dim"), "cancelled": ("cube", "dim"), "error": ("warning", "red"),
     "offline": ("wifi-slash", "dim"), "auth": ("warning", "orange"), "setup": ("cube", "dim"),
     "connecting": ("clock", "dim"), "inuse": ("lock", "orange"),
+}
+KLIPPER_STATES = {  # print_stats.state -> our state
+    "standby": "idle", "printing": "printing", "paused": "paused", "complete": "done",
+    "cancelled": "cancelled", "error": "error",
 }
 TCP_STATES = {  # MachineStatus from ~M119 -> our state
     "ready": "idle", "building_from_sd": "printing", "paused": "paused",
@@ -178,6 +189,9 @@ draw_lock = threading.Lock()
 last_tile = last_page = last_badge = last_active = None
 estimator = RateEstimator()
 busy_streak = 0
+detected = None       # "klipper" or "flashforge" once the printer has been probed (firmware "auto")
+offline_streak = 0
+metadata_cache = {}   # file name -> the slicer's time estimate in seconds
 camera = {"frame": None, "size": None, "error": ""}  # replaced wholesale by the camera thread
 camera_on = False   # True while a camera thread should keep running
 camera_gen = 0      # lets an old camera thread notice it has been replaced
@@ -219,6 +233,130 @@ def http_post(path, **extra):
 
 def fetch_detail():
     return http_post("detail")
+
+
+class AuthNeeded(Exception):
+    """Moonraker wants a login (this PC isn't in its trusted_clients)."""
+
+
+class Refused(Exception):
+    """The printer answered, but said no."""
+
+
+def moon_request(path, method="GET", timeout=5):
+    """One call to Moonraker; returns the parsed JSON, e.g. {"result": ...}."""
+    request = urllib.request.Request(f"http://{settings['ip']}:{MOONRAKER_PORT}{path}", method=method,
+                                     data=b"" if method == "POST" else None)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise AuthNeeded() from None
+        try:
+            message = (json.loads(e.read().decode("utf-8")).get("error") or {}).get("message")
+        except (ValueError, OSError, AttributeError):
+            message = None
+        raise Refused(message or f"HTTP {e.code}") from None
+
+
+def probe_klipper():
+    """Does something on this IP answer like Moonraker?"""
+    try:
+        return "result" in moon_request("/server/info", timeout=2)
+    except AuthNeeded:
+        return True  # only Moonraker answers 401 here
+    except (Refused, OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def current_route():
+    """'klipper', 'http' (Flashforge with check code) or 'tcp' (Flashforge, IP only)."""
+    global detected
+    firmware = settings.get("firmware") or "auto"
+    if firmware == "klipper":
+        return "klipper"
+    if firmware == "auto":
+        if detected is None:
+            detected = "klipper" if probe_klipper() else "flashforge"
+        if detected == "klipper":
+            return "klipper"
+    return "http" if use_http() else "tcp"
+
+
+KLIPPER_QUERY = "/printer/objects/query?webhooks&print_stats&virtual_sdcard&display_status&extruder&heater_bed"
+
+
+def parse_klipper(status, estimated=0.0):
+    """Builds the same dict as parse_detail from Moonraker's object status."""
+    stats, sd = status.get("print_stats") or {}, status.get("virtual_sdcard") or {}
+    shown, web = status.get("display_status") or {}, status.get("webhooks") or {}
+    extruder, bed = status.get("extruder") or {}, status.get("heater_bed") or {}
+    raw = str(stats.get("state") or "").lower()
+    st = KLIPPER_STATES.get(raw, "busy")
+    klipper_down = str(web.get("state") or "ready").lower() in ("shutdown", "error")
+    if klipper_down:
+        st = "error"  # Klipper itself is down; print_stats keeps its last value
+    progress = clamp(float(sd.get("progress") or shown.get("progress") or 0), 0.0, 1.0)
+    elapsed = float(stats.get("print_duration") or 0)  # time spent printing, pauses excluded
+    nozzle, nozzle_target = float(extruder.get("temperature") or 0), float(extruder.get("target") or 0)
+    if st == "printing" and elapsed < 1 and nozzle_target - nozzle > 8:
+        st = "heating"  # the start macro is still warming things up
+    progress = 1.0 if st == "done" else (0.0 if st in ("idle", "heating", "cancelled") else progress)
+    left = remaining_seconds(estimated, elapsed, progress) if st in ("printing", "paused") else None
+    eta = (datetime.now() + timedelta(seconds=left)).strftime("%H:%M") if left is not None else None
+    info = stats.get("info") or {}
+    return {
+        "state": st, "raw": raw, "progress": progress, "left": left, "eta": eta, "source": "klipper",
+        "file": str(stats.get("filename") or "").replace("\\", "/").split("/")[-1],
+        "layer": int(info.get("current_layer") or 0), "layers": int(info.get("total_layer") or 0),
+        "nozzle": nozzle, "nozzle_target": nozzle_target,
+        "bed": float(bed.get("temperature") or 0), "bed_target": float(bed.get("target") or 0),
+        "message": str((web.get("state_message") if klipper_down else stats.get("message")) or "") if st == "error" else "",
+    }
+
+
+def klipper_estimate(filename):
+    """The slicer's time estimate for a file, in seconds (0 if unknown). Asked once per file."""
+    if filename not in metadata_cache:
+        try:
+            meta = moon_request("/server/files/metadata?filename=" + urllib.parse.quote(filename)).get("result") or {}
+            value = float(meta.get("estimated_time") or 0)
+        except (Refused, AuthNeeded, OSError, ValueError, TypeError, http.client.HTTPException):
+            value = 0.0
+        if len(metadata_cache) > 20:
+            metadata_cache.clear()
+        metadata_cache[filename] = value
+    return metadata_cache[filename]
+
+
+def fetch_klipper():
+    status = (moon_request(KLIPPER_QUERY).get("result") or {}).get("status")
+    if not isinstance(status, dict):
+        raise ValueError("Moonraker's reply had no status")
+    stats = status.get("print_stats") or {}
+    filename = str(stats.get("filename") or "")
+    estimated = klipper_estimate(filename) if filename and stats.get("state") in ("printing", "paused") else 0.0
+    return parse_klipper(status, estimated)
+
+
+def klipper_webcam_urls():
+    """Pictures from the webcams set up in Fluidd/Mainsail: a snapshot (one picture per request) first."""
+    try:
+        webcams = (moon_request("/server/webcams/list").get("result") or {}).get("webcams") or []
+    except (Refused, AuthNeeded, OSError, ValueError, http.client.HTTPException):
+        return []
+    ip, urls = settings["ip"], []
+    for cam in webcams:
+        if not isinstance(cam, dict) or cam.get("enabled") is False:
+            continue
+        for key in ("snapshot_url", "stream_url"):
+            raw = str(cam.get(key) or "").strip()
+            if raw.startswith(("http://", "https://")):
+                urls.append(raw)
+            elif raw.startswith("/"):  # relative to the web page's address, usually port 80
+                urls += [f"http://{ip}{raw}", f"http://{ip}:{MOONRAKER_PORT}{raw}"]
+    return urls
 
 
 class InUse(Exception):
@@ -273,14 +411,17 @@ class NotApplicable(Exception):
     """Pause/Resume asked for, but the printer's own state says it doesn't apply."""
 
 
-class Refused(Exception):
-    """The printer answered, but said no."""
-
-
 def send_job(action):
     """action is 'pause' or 'continue'. The printer's state is checked first, so a stale
     click can never start a print or pause one that has already finished."""
     problem = "Nothing is printing." if action == "pause" else "The printer isn't paused."
+    if current_route() == "klipper":
+        # Moonraker says "ok" to pause/resume even when it makes no sense, so look first
+        status = (moon_request(KLIPPER_QUERY).get("result") or {}).get("status") or {}
+        if str((status.get("print_stats") or {}).get("state") or "").lower() != ("printing" if action == "pause" else "paused"):
+            raise NotApplicable(problem)
+        moon_request("/printer/print/" + ("pause" if action == "pause" else "resume"), method="POST")
+        return
     if use_http():
         detail = http_post("detail").get("detail") or {}
         status = str(detail.get("status", "")).lower()
@@ -324,6 +465,8 @@ def run_job(action):
         control_note = str(e)
     except InUse:
         control_note = "Another program is connected to the printer. Try again in a moment."
+    except AuthNeeded:
+        control_note = "Moonraker asked for a login. Add this PC to trusted_clients in moonraker.conf."
     except Refused as e:
         control_note = f"The printer said: {e}"
     except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as e:
@@ -379,15 +522,27 @@ def camera_url():
             or f"http://{settings['ip']}:8080/?action=stream")
 
 
+def camera_candidates():
+    """Addresses to try, best first: yours, else Fluidd/Mainsail's webcams, else the usual ones."""
+    if settings.get("camera") or state.get("source") != "klipper":
+        return [camera_url()]
+    ip = settings["ip"]
+    urls = klipper_webcam_urls() + [f"http://{ip}/webcam/?action=snapshot", f"http://{ip}/webcam/?action=stream",
+                                    f"http://{ip}:8080/?action=stream", f"http://{ip}:8080/stream"]
+    return list(dict.fromkeys(urls))
+
+
 def camera_loop(gen):
     global camera
-    url = camera_url()
-    if use_http() and not settings.get("camera"):
+    urls = camera_candidates()
+    index = 0
+    if use_http() and not settings.get("camera") and state.get("source") != "klipper":
         try:  # the 5M Pro's camera can be switched off; ask it to turn on
             http_post("control", payload={"cmd": "streamCtrl_cmd", "args": {"action": "open"}})
         except (OSError, ValueError, http.client.HTTPException):
             pass
     while camera_on and camera_gen == gen:
+        url = urls[index]
         try:
             frame = grab_frame(url)
             camera = {"frame": frame, "size": jpeg_size(frame), "error": ""}
@@ -395,7 +550,8 @@ def camera_loop(gen):
         except (OSError, ValueError, http.client.HTTPException) as e:
             warn_once(f"camera: {type(e).__name__}: {e}")
             camera = {"frame": None, "size": None, "error": url}
-            pause = 3  # try again, but gently
+            index = (index + 1) % len(urls)  # try the next address
+            pause = 1 if len(urls) > 1 else 3  # and keep trying, but gently
         if camera_on and camera_gen == gen:
             draw()
         time.sleep(pause)
@@ -415,12 +571,15 @@ def sync_camera():
 
 def poll_once():
     """One status check. Updates `state` and the screen; returns seconds to wait."""
-    global state, busy_streak, control_note
+    global state, busy_streak, control_note, offline_streak, detected
     wait = 60
     try:
-        if not configured():
+        route = current_route() if configured() else None
+        if route is None:
             new = {"state": "setup"}
-        elif use_http():
+        elif route == "klipper":
+            new = fetch_klipper()
+        elif route == "http":
             reply = fetch_detail()
             if reply.get("code") == 3:
                 new = {"state": "auth"}
@@ -430,9 +589,9 @@ def poll_once():
                 new = parse_detail(reply["detail"])
         else:
             new = with_eta(fetch_tcp())
-        busy_streak = 0
+        busy_streak = offline_streak = 0
         if new["state"] in ("printing", "heating", "paused", "busy"):
-            wait = POLL_ACTIVE if new.get("source") == "http" else POLL_ACTIVE_TCP
+            wait = POLL_ACTIVE_TCP if new.get("source") == "tcp" else POLL_ACTIVE
         else:
             wait = POLL_IDLE
     except InUse:
@@ -441,9 +600,14 @@ def poll_once():
                                       "cancelled", "error")
         new = state if has_data and busy_streak < 3 else {"state": "inuse"}  # ignore short clashes
         wait = POLL_ACTIVE
-    except (OSError, ValueError, KeyError, TypeError) as e:  # no connection, bad reply
+    except AuthNeeded:
+        new, wait = {"state": "auth", "source": "klipper"}, POLL_OFFLINE
+    except (OSError, ValueError, KeyError, TypeError, Refused, http.client.HTTPException) as e:  # no connection, bad reply
         warn_once(f"printer request failed: {type(e).__name__}: {e}")
         new, wait = {"state": "offline"}, POLL_OFFLINE
+        offline_streak += 1
+        if offline_streak >= 3:
+            detected, offline_streak = None, 0  # look again: maybe a different printer answers here now
     finished = state["state"] in ("printing", "heating", "paused") and new["state"] == "done"
     state = new
     if control_note and not control_note.endswith("\u2026"):
@@ -485,6 +649,8 @@ def describe(s, short):
         return "Idle", f"nozzle {s['nozzle']:.0f}\u00b0"
     if st == "busy":
         return "Working", s.get("raw", "")
+    if st == "auth" and s.get("source") == "klipper":
+        return "Login needed", "see Settings"
     return {"error": ("Error", "check the printer"), "offline": ("Offline", "can't reach it"),
             "auth": ("Check code", "see Settings"), "setup": ("Set up", "click to begin"),
             "inuse": ("In use", "by another app"), "cancelled": ("Cancelled", "")}.get(st, (LABELS.get(st, ""), ""))
@@ -553,8 +719,10 @@ def camera_view(s):
                       f"No picture from {c['error']}", size="small", color="dim", wrap=True),
         ], gap=6, align="center", justify="center")
         side = [] if waiting else [fenn.text(
-            "The Adventurer 5M Pro has a built-in camera; the standard 5M doesn't. For any other "
-            "camera, put its MJPEG or picture address under Settings.",
+            ("Fluidd/Mainsail lists no webcam that works. Add one in its settings (Webcams), or put a "
+             "picture address under Settings." if state.get("source") == "klipper" else
+             "The Adventurer 5M Pro has a built-in camera; the standard 5M doesn't. For any other "
+             "camera, put its MJPEG or picture address under Settings."),
             size="small", color="faint", wrap=True)]
     head, sub = describe(s, short=False)
     side = [fenn.text(head, size="title"), fenn.text(sub or " ", size="small", color="dim")] + side
@@ -580,6 +748,8 @@ def status_view(s):
         lines.append(fenn.text(f"Nozzle {s['nozzle']:.0f}\u00b0/{s['nozzle_target']:.0f}\u00b0    "
                                f"Bed {s['bed']:.0f}\u00b0/{s['bed_target']:.0f}\u00b0",
                                size="small", mono=True, color="dim"))
+        if s.get("source") == "klipper":
+            lines.append(fenn.text("via Klipper (Moonraker)", size="small", color="faint"))
         extra = controls(s)
         if extra:
             lines.append(extra)
@@ -593,10 +763,12 @@ def status_view(s):
         "idle": f"The printer is idle. Nozzle {s.get('nozzle', 0):.0f}\u00b0, bed {s.get('bed', 0):.0f}\u00b0.",
         "busy": "The printer is busy (homing or calibrating).",
         "cancelled": "The last print was cancelled.",
-        "error": "The printer reports an error. Check its screen.",
+        "error": s.get("message") or "The printer reports an error. Check its screen.",
         "offline": "Can't reach the printer. Check that it is on, on the same network, and that "
                    "the IP address in Settings is right.",
-        "auth": "The printer rejected the serial number or check code. Check them in Settings.",
+        "auth": ("Moonraker asked for a login. Add this PC's address to trusted_clients in the [authorization] "
+                 "section of moonraker.conf, then restart Moonraker." if s.get("source") == "klipper" else
+                 "The printer rejected the serial number or check code. Check them in Settings."),
         "setup": "Enter your printer's details in Settings to start.",
         "connecting": "Connecting\u2026",
         "inuse": "Another program (FlashPrint or Orca, for example) is connected to the printer "
@@ -612,14 +784,20 @@ def settings_view():
               for k in ("ip", "serial", "code")]
     camera_input = fenn.text_input("camera", settings.get("camera", ""), live=True,
                                    hint="Camera address (optional), e.g. http://192.168.1.50:8080/?action=stream")
+    firmware = settings.get("firmware") or "auto"
     return fenn.column([
+        fenn.row([fenn.text("Firmware", size="small", color="dim"),
+                  fenn.chips("firmware", ["Auto", "Flashforge", "Klipper (Fluidd)"],
+                             selected=FIRMWARES.index(firmware) if firmware in FIRMWARES else 0)],
+                 gap=10, align="center"),
         fenn.row(inputs, gap=8),
         camera_input,
         fenn.row([fenn.button("save", label="Save", primary=True),
                   fenn.text(form_error, size="small", color="red")], gap=10, align="center"),
-        fenn.text("Only the IP address is needed. The serial number and check code (printer "
-                  "settings) give exact layers and the slicer's time estimate. Leave the camera "
-                  "empty to use the printer's own. Everything stays on your network.",
+        fenn.text("Only the IP address is needed. Klipper printers (Fluidd or Mainsail) are found "
+                  "automatically. For a Flashforge, the serial number and check code give exact layers "
+                  "and the slicer's time estimate. Leave the camera empty to use the printer's own. "
+                  "Everything stays on your network.",
                   size="small", color="faint", wrap=True),
     ], gap=10)
 
@@ -668,19 +846,22 @@ def draw():
 
 
 def save_settings():
-    global settings, state, tab, form_error
+    global settings, state, tab, form_error, detected
     merged = {**settings, **draft}
     if not HOST.match(merged.get("ip", "")):
         form_error = "That doesn't look like an IP address or host name."
-    elif bool(merged.get("serial")) != bool(merged.get("code")):
+    elif merged.get("firmware") != "klipper" and bool(merged.get("serial")) != bool(merged.get("code")):
         form_error = "Enter both the serial number and check code, or leave both empty."
     elif merged.get("camera") and not CAMERA_URL.match(merged["camera"]):
         form_error = "The camera address should start with http:// or https://"
     else:
         settings = {k: merged.get(k, "") for k in FIELDS}
+        if merged.get("firmware") in FIRMWARES[1:]:  # "auto" is the default and isn't stored
+            settings["firmware"] = merged["firmware"]
         app.save("settings", settings)
         draft.clear()
         form_error, tab = "", TAB_STATUS
+        detected = None
         state = {"state": "connecting"}
         wake.set()  # check the printer straight away
     sync_camera()
@@ -700,6 +881,20 @@ for _field in FIELDS:
 @app.on("save")
 def on_save(event):
     save_settings()
+
+
+@app.on("firmware")
+def on_firmware(event):
+    global settings, detected
+    index = int((event.get("value") or {}).get("index", 0))
+    firmware = FIRMWARES[index] if 0 <= index < len(FIRMWARES) else "auto"
+    settings = {k: v for k, v in settings.items() if k != "firmware"}
+    if firmware != "auto":
+        settings["firmware"] = firmware
+    app.save("settings", settings)
+    detected = None  # look again with the new choice
+    wake.set()
+    draw()
 
 
 @app.on("tab")
